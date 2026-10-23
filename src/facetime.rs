@@ -1312,8 +1312,12 @@ impl FTClient {
                     // if we propped it up for a join, someone else (or us) have joined
                     // so we don't need to prop it anymore
                     // make sure web client to not hang up on people who are picking up for us
+                    //
+                    // iOS 26.5 callee hangs up ~1s after the unprop leave is sent
+                    // here, so keep the propped participant until our web client
+                    // leaves (unpropped in the 208 handler).
                     if session.is_propped && sender.starts_with("temp:") {
-                        self.unprop_conv(session).await?;
+                        info!("web client joined; keeping propped participant until it leaves");
                     }
 
                     if message.r#type() == ConversationMessageType::Invitation {
@@ -1400,6 +1404,12 @@ impl FTClient {
                         // remove us from the group list too cause we can't join back
                         session.members.retain(|a| a.handle != handle_left);
                         session.participants.remove(&id.to_string()).ok_or(PushError::BadMsg)?;
+
+                        // our web client is gone, so drop the propped participant now
+                        if session.is_propped {
+                            info!("web client left; unpropping now");
+                            self.unprop_conv(session).await?;
+                        }
                     }
                     
                     let guid = session.group_id.clone();
