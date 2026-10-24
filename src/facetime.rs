@@ -1309,11 +1309,12 @@ impl FTClient {
                         }),
                     });
 
-                    // if we propped it up for a join, someone else (or us) have joined
-                    // so we don't need to prop it anymore
-                    // make sure web client to not hang up on people who are picking up for us
+                    // If we propped the conversation up for a web client join, keep the
+                    // propped participant around until that client leaves. iOS 26.5
+                    // treats the 208 leave we used to send here as the remote side
+                    // ending the call and hangs up ~1s later. See OpenBubbles#277.
                     if session.is_propped && sender.starts_with("temp:") {
-                        self.unprop_conv(session).await?;
+                        info!("Web client joined; keeping propped participant until it leaves");
                     }
 
                     if message.r#type() == ConversationMessageType::Invitation {
@@ -1400,6 +1401,14 @@ impl FTClient {
                         // remove us from the group list too cause we can't join back
                         session.members.retain(|a| a.handle != handle_left);
                         session.participants.remove(&id.to_string()).ok_or(PushError::BadMsg)?;
+
+                        // Once the last web client leaves there is nothing left to keep the
+                        // propped participant around for, so send our leave now (and not on
+                        // join, which makes iOS 26.5 hang up). See OpenBubbles#277.
+                        if session.is_propped && !session.participants.values().any(|a| a.handle.starts_with("temp:")) {
+                            info!("Last web client left; unpropping conversation");
+                            self.unprop_conv(session).await?;
+                        }
                     }
                     
                     let guid = session.group_id.clone();
