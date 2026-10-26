@@ -64,6 +64,18 @@ pub use relay::RelayConfig;
 pub use util::get_gateways_for_mccmnc;
 
 
+/// The client identity reported to GrandSlam during Apple Account sign-in.
+///
+/// Apple stopped accepting the old Android/legacy third-party identities in
+/// October 2026 (`-80045`, then `-80046`), which broke every sideloading tool.
+/// The community fix is to use a macOS-ADI anisette server and report a
+/// current Mac, so this matches the client info SideStore/isideload and
+/// SideInstaller send. Keep the two values in sync.
+#[cfg(not(target_os = "macos"))]
+pub const GSA_CURRENT_MAC_CLIENT_INFO: &str = "<MacBookPro18,3> <macOS;26.6;25F84>";
+#[cfg(not(target_os = "macos"))]
+pub const GSA_CURRENT_MAC_USER_AGENT: &str = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)";
+
 pub struct RegisterMeta {
     pub hardware_version: String,
     pub os_version: String,
@@ -101,17 +113,39 @@ pub trait OSConfig: Sync + Send {
     }
 
     fn get_gsa_config(&self, push: &APSState, require_mac: bool) -> LoginClientInfo {
+        let _ = require_mac;
+
+        // On non-macOS platforms we always use the remote anisette provider,
+        // which now talks to macOS-ADI servers. Report the current Mac those
+        // servers expect instead of the hosted/legacy identity, which Apple
+        // rejects with -80045/-80046. On real macOS, keep using the machine's
+        // own identity because AOSKit generates anisette data for it.
+        #[cfg(not(target_os = "macos"))]
+        let (mme_client_info_akd, mme_client_info, akd_user_agent, update_account_bundle_id) = (
+            format!("{} <com.apple.AuthKit/1 (com.apple.akd/1.0)>", GSA_CURRENT_MAC_CLIENT_INFO),
+            format!("{} <com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)>", GSA_CURRENT_MAC_CLIENT_INFO),
+            GSA_CURRENT_MAC_USER_AGENT.to_string(),
+            format!("{} <com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)>", GSA_CURRENT_MAC_CLIENT_INFO),
+        );
+        #[cfg(target_os = "macos")]
+        let (mme_client_info_akd, mme_client_info, akd_user_agent, update_account_bundle_id) = (
+            self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)", require_mac),
+            self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)", require_mac),
+            "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string(),
+            self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)", require_mac),
+        );
+
         LoginClientInfo {
             ak_context_type: "imessage".to_string(),
             client_app_name: "Messages".to_string(),
             client_bundle_id: "com.apple.MobileSMS".to_string(),
-            mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)", require_mac),
-            mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)", require_mac),
-            akd_user_agent: "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string(),
+            mme_client_info_akd,
+            mme_client_info,
+            akd_user_agent,
             browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
             hardware_headers: self.get_gsa_hardware_headers(),
             push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),
-            update_account_bundle_id: self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)", require_mac),
+            update_account_bundle_id,
         }
     }
 }

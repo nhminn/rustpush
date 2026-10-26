@@ -392,10 +392,15 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
     }
 
+    #[cfg(not(target_os = "macos"))]
+    let delegate_client_info = format!("{} <{}>", crate::GSA_CURRENT_MAC_CLIENT_INFO, os_config.get_aoskit_version());
+    #[cfg(target_os = "macos")]
+    let delegate_client_info = os_config.get_mme_clientinfo(&os_config.get_aoskit_version());
+
     let resp = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
-            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
+            .header("X-Mme-Client-Info", delegate_client_info)
             .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers.clone())
