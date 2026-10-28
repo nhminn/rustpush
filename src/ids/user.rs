@@ -1092,7 +1092,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     }).collect::<Vec<_>>();
 
     let register_meta = config.get_register_meta();
-    let body = Value::Dictionary(Dictionary::from_iter([
+    let mut body = Dictionary::from_iter([
         ("device-name", Value::String(config.get_device_name())),
         ("hardware-version", Value::String(register_meta.hardware_version)),
         ("language", Value::String("en-US".to_string())),
@@ -1100,8 +1100,16 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
         ("private-device-data", Value::Dictionary(config.get_private_data())),
         ("services", Value::Array(services)),
         ("software-version", Value::String(register_meta.software_version)),
-        ("validation-data", Value::Data(config.generate_validation_data().await?))
-    ].into_iter()));
+    ].into_iter());
+    match config.generate_validation_data().await {
+        Ok(data) => {
+            body.insert("validation-data".to_string(), Value::Data(data));
+        }
+        Err(e) => {
+            warn!("Registering without validation data: {e}");
+        }
+    }
+    let body = Value::Dictionary(body);
 
     let mut request = SignedRequest::new("id-register", Method::POST)
             .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))

@@ -383,7 +383,16 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         }
     };
 
-    let validation_data = os_config.generate_validation_data().await?;
+    // Validation data is Apple's Mac-hardware attestation. When it is unavailable
+    // (for example a public-source build without the closed mint), still attempt
+    // the delegate login; Apple may accept the request without the header.
+    let validation_data = match os_config.generate_validation_data().await {
+        Ok(data) => Some(data),
+        Err(e) => {
+            warn!("Could not generate validation data for delegate login: {e}");
+            None
+        }
+    };
 
     let base_headers = account.anisette.lock().await.get_headers().await?.clone();
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
@@ -397,17 +406,18 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     #[cfg(target_os = "macos")]
     let delegate_client_info = os_config.get_mme_clientinfo(&os_config.get_aoskit_version());
 
-    let resp = REQWEST.post(os_config.get_login_url())
+    let mut login_request = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
             .header("X-Mme-Client-Info", delegate_client_info)
-            .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers.clone())
             .basic_auth(username, Some(pet))
-            .body(plist_to_string(&request)?)
-            .send()
-            .await?;
+            .body(plist_to_string(&request)?);
+    if let Some(validation_data) = &validation_data {
+        login_request = login_request.header("X-Mme-Nas-Qualify", base64_encode(validation_data));
+    }
+    let resp = login_request.send().await?;
     let text = resp.text().await?;
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
@@ -1061,12 +1071,25 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
         })
     }
 
+    /// True once the circle reached step 4 and the PET is available. The caller
+    /// can retry `do_login` without sending the code again.
+    pub fn is_ready_for_login(&self) -> bool {
+        self.saved_step.as_ref().map(|step| step.step == 4).unwrap_or(false)
+    }
+
     pub async fn send_code(&mut self, password: &str) -> Result<(), PushError> {
         
         let Some(request) = &self.saved_step else {
             self.saved_password = Some(password.to_string());
             return Ok(())
         };
+
+        // Step 4 means the code was already verified and the PET is available.
+        // Retrying the submit must not send a second SRP proof.
+        if request.step == 4 {
+            self.saved_password = Some(password.to_string());
+            return Ok(())
+        }
 
         if request.step != 2 {
             return Err(PushError::WrongStep(request.step))

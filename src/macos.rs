@@ -1,8 +1,7 @@
 
-use std::{collections::HashMap, time::{Duration, SystemTime}};
+use std::{collections::HashMap, sync::{LazyLock, Mutex}, time::{Duration, Instant, SystemTime}};
 
 use async_trait::async_trait;
-use open_absinthe::nac::ValidationCtx;
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,6 +9,115 @@ use uuid::Uuid;
 use crate::{activation::ActivationInfo, util::{encode_hex, get_bag, REQWEST, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 pub use open_absinthe::nac::HardwareConfig;
+
+/// A validation stamp minted by the app (the open-madrid NAC mint) and handed to
+/// Rust before sign-in. Apple stamps are short-lived, so keep the cache small and
+/// reject anything older than ten minutes.
+struct ValidationDataCache {
+    session250: Vec<u8>,
+    data: Vec<u8>,
+    created: Instant,
+}
+
+static VALIDATION_DATA: LazyLock<Mutex<Option<ValidationDataCache>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub fn set_validation_data(session250: Vec<u8>, data: Vec<u8>) {
+    *VALIDATION_DATA.lock().unwrap() = Some(ValidationDataCache {
+        session250,
+        data,
+        created: Instant::now(),
+    });
+}
+
+fn get_validation_data(session250: &[u8]) -> Option<Vec<u8>> {
+    let guard = VALIDATION_DATA.lock().unwrap();
+    let cache = guard.as_ref()?;
+    if cache.session250 != session250 || cache.created.elapsed() > Duration::from_secs(600) {
+        return None;
+    }
+    Some(cache.data.clone())
+}
+
+pub fn clear_validation_data() {
+    *VALIDATION_DATA.lock().unwrap() = None;
+}
+
+/// `HardwareConfig::to_bin`, the 250-byte session material consumed by the NAC mint.
+///
+/// This is the byte-verified grammar documented by open-madrid (spec §1.1 C56-c):
+/// length-prefixed strings, the raw 6-byte MAC, a constant dword, then seven
+/// length-prefixed binary items in Mac-Hardware-Info export order.
+pub fn hardware_config_to_bin(hw: &HardwareConfig) -> Result<Vec<u8>, PushError> {
+    fn write_str(out: &mut Vec<u8>, value: &str) -> Result<(), PushError> {
+        let bytes = value.as_bytes();
+        if bytes.len() >= 255 {
+            return Err(PushError::ValidationDataUnavailable(
+                "hardware configuration string is too long".to_string(),
+            ));
+        }
+        out.push((bytes.len() + 1) as u8);
+        out.extend_from_slice(bytes);
+        out.push(0);
+        Ok(())
+    }
+
+    fn write_item(out: &mut Vec<u8>, value: &[u8]) -> Result<(), PushError> {
+        if value.len() > 255 {
+            return Err(PushError::ValidationDataUnavailable(
+                "hardware configuration blob is too long".to_string(),
+            ));
+        }
+        out.push(value.len() as u8);
+        out.extend_from_slice(value);
+        Ok(())
+    }
+
+    let mut out = Vec::with_capacity(250);
+    write_str(&mut out, &hw.product_name)?;
+    out.extend_from_slice(&hw.io_mac_address);
+    write_str(&mut out, &hw.platform_serial_number)?;
+    write_str(&mut out, &hw.platform_uuid)?;
+    write_str(&mut out, &hw.root_disk_uuid)?;
+    write_str(&mut out, &hw.board_id)?;
+    write_str(&mut out, &hw.os_build_num)?;
+    out.extend_from_slice(&[0x00, 0x03, 0x0b, 0x52]);
+    write_item(&mut out, &hw.platform_serial_number_enc)?;
+    write_item(&mut out, &hw.platform_uuid_enc)?;
+    write_item(&mut out, &hw.root_disk_uuid_enc)?;
+    write_item(&mut out, &hw.rom)?;
+    write_item(&mut out, &hw.rom_enc)?;
+    write_item(&mut out, hw.mlb.as_bytes())?;
+    write_item(&mut out, &hw.mlb_enc)?;
+    Ok(out)
+}
+
+/// Step 1 of the validation exchange: the `id-validation-cert` chain.
+pub async fn fetch_validation_cert() -> Result<Vec<u8>, PushError> {
+    let url = get_bag(IDS_BAG, "id-validation-cert").await?.into_string().unwrap();
+    let response = REQWEST.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(PushError::StatusError(response.status()));
+    }
+    let response: CertsResponse = plist::from_bytes(&response.bytes().await?)?;
+    Ok(response.cert.into())
+}
+
+/// Step 2 of the validation exchange: POST the session-info-request and return
+/// the server's `session-info` blob.
+pub async fn initialize_validation(request: Vec<u8>) -> Result<Vec<u8>, PushError> {
+    let init = SessionInfoRequest {
+        session_info_request: request.into(),
+    };
+    let info = plist_to_buf(&init)?;
+    let url = get_bag(IDS_BAG, "id-initialize-validation").await?.into_string().unwrap();
+    let response = REQWEST.post(url).body(info).send().await?;
+    if !response.status().is_success() {
+        return Err(PushError::StatusError(response.status()));
+    }
+    let response: SessionInfoResponse = plist::from_bytes(&response.bytes().await?)?;
+    Ok(response.session_info.into())
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
@@ -91,31 +199,17 @@ impl OSConfig for MacOSConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
+        let session250 = hardware_config_to_bin(&self.inner)?;
+        if let Some(data) = get_validation_data(&session250) {
+            return Ok(data);
+        }
 
-        let url = get_bag(IDS_BAG, "id-validation-cert").await?.into_string().unwrap();
-        let key = REQWEST.get(url)
-            .send().await?;
-        let response: CertsResponse = plist::from_bytes(&key.bytes().await?)?;
-        let certs: Vec<u8> = response.cert.into();
-
-        let mut output_req = vec![];
-        let mut ctx = ValidationCtx::new(&certs, &mut output_req, &self.inner)?;
-
-        let init = SessionInfoRequest {
-            session_info_request: output_req.into()
-        };
-
-        let info = plist_to_buf(&init)?;
-        let url = get_bag(IDS_BAG, "id-initialize-validation").await?.into_string().unwrap();
-        let activation = REQWEST.post(url)
-            .body(info)
-            .send().await?;
-
-        let response: SessionInfoResponse = plist::from_bytes(&activation.bytes().await?)?;
-        let output: Vec<u8> = response.session_info.into();
-        ctx.key_establishment(&output)?;
-
-        Ok(ctx.sign()?)
+        // The public OpenAbsinthe dependency is a stub. The real mint lives in the
+        // app's vendored Kotlin implementation; the Dart setup flow mints a stamp
+        // and installs it here before the delegate login / IDS registration.
+        Err(PushError::ValidationDataUnavailable(
+            "no validation data was prepared for this hardware".to_string(),
+        ))
     }
 
     fn get_protocol_version(&self) -> u32 {
