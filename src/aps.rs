@@ -1196,7 +1196,11 @@ impl APSConnectionResource {
                 match ack_receiver.recv().await {
                     Ok(APSMessage::Notification { id, topic: _, token: _, payload: _, channel: _ }) => {
                         let Some(upgrade) = ack_ref.upgrade() else { break };
-                        let _ = upgrade.send(APSMessage::Ack { token: Some(upgrade.get_token().await), for_id: id, status: 0 }).await;
+                        // A notification can only arrive on a live connection,
+                        // but never panic the app if the token vanished.
+                        if let Ok(token) = upgrade.get_token_checked().await {
+                            let _ = upgrade.send(APSMessage::Ack { token: Some(token), for_id: id, status: 0 }).await;
+                        }
                     }
                     Err(RecvError::Closed) => break,
                     _ => continue,
@@ -1256,8 +1260,15 @@ impl APSConnectionResource {
         (resource, err)
     }
 
+    /// The push token, or an error while the connection is still activating or
+    /// has failed. Callers that can surface an error should use this instead of
+    /// [Self::get_token].
+    pub async fn get_token_checked(&self) -> Result<[u8; 32], PushError> {
+        self.state.read().await.token.ok_or(PushError::APSNotReady("token"))
+    }
+
     pub async fn get_token(&self) -> [u8; 32] {
-        self.state.read().await.token.expect("Token not found; re-enter device details if persistent")
+        self.get_token_checked().await.expect("Token not found; re-enter device details if persistent")
     }
 
     pub async fn request_topics(&self, topics: &[&str]) -> APSInterestToken {
@@ -1306,6 +1317,14 @@ impl APSConnectionResource {
             state.token = Some(token);
         }
 
+        // A connection without a token cannot register a phone number or send
+        // messages. Treat it as a failed generation so the manager retries
+        // instead of the app panicking on the next get_token().
+        if state.token.is_none() {
+            drop(state);
+            return Err(PushError::APSNotReady("token"));
+        }
+
         drop(state);
         info!("Sending");
         self.send(APSMessage::SetState { state: 1 }).await?;
@@ -1321,7 +1340,7 @@ impl APSConnectionResource {
         self.send(APSMessage::Notification {
             id: my_id,
             topic: sha1(topic.as_bytes()),
-            token: Some(self.get_token().await),
+            token: Some(self.get_token_checked().await?),
             payload: plist::to_value(&data)?,
             channel: None,
         }).await?;

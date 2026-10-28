@@ -54,6 +54,28 @@ const FAIRPLAY_KEYS: &[(&'static [u8], &'static [u8])] = &[
     include_cert!("4056631661436364584235346952208"),
 ];
 
+/// Apple wraps the activation plist in `<Protocol>`. The plist used to be
+/// emitted on one line, but since October 2026 it is pretty-printed across
+/// several lines, so the match has to span newlines (`.all(true)`).
+fn extract_protocol(body: &str) -> Option<&str> {
+    let protocol = Regex::new(r"(?s)<Protocol>(.*)</Protocol>").ok()?;
+    let captures = protocol.captures(body)?;
+    captures.get(1).map(|m| m.as_str())
+}
+
+/// The start of an unexpected activation response, short enough to show in the
+/// app's error banner. Apple's error pages are otherwise invisible to users.
+fn response_snippet(body: &str) -> String {
+    const MAX: usize = 300;
+    let trimmed = body.trim();
+    let snippet: String = trimmed.chars().take(MAX).collect();
+    if trimmed.chars().count() > MAX {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
 fn fairplay_sign(data: &[u8]) -> Result<(&'static [u8], Vec<u8>), PushError> {
     let (cert, key) = FAIRPLAY_KEYS.choose(&mut thread_rng()).expect("no keys!");
 
@@ -120,23 +142,67 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
         activation_info: String,
     }
 
-    let request = REQWEST
+    let response = REQWEST
         .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
         .header("User-Agent", os_config.get_normal_ua("ApplePushService/4.0"))
         .form(&FormBody { activation_info: plist_to_string(&request)? })
-        .send().await?
-        .text().await?;
+        .send().await?;
 
-    let protocol = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap();
-    let captures = protocol.captures(&request).ok_or(PushError::AlbertCertParseError)?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        return Err(PushError::AlbertCertParseError(format!(
+            "activation returned HTTP {status}: {}",
+            response_snippet(&body)
+        )));
+    }
+
+    let protocol = extract_protocol(&body).ok_or_else(|| {
+        PushError::AlbertCertParseError(format!(
+            "activation response had no <Protocol>: {}",
+            response_snippet(&body)
+        ))
+    })?;
     
-    let parsed: Value = plist::from_bytes(captures[1].as_bytes())?;
+    let parsed: Value = plist::from_bytes(protocol.as_bytes())?;
 
-    let certificate = get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()).ok_or(PushError::AlbertCertParseError)?;
+    let certificate = get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()).ok_or_else(|| {
+        PushError::AlbertCertParseError(format!(
+            "activation record had no DeviceCertificate: {}",
+            response_snippet(protocol)
+        ))
+    })?;
 
     Ok(KeyPairNew {
         cert: X509::from_pem(certificate)?.to_der()?,
         private: key
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_pretty_printed_protocol() {
+        // Apple started pretty-printing the activation plist in October 2026.
+        let body = "<Document>\n\t<Protocol><plist version=\"1.0\">\n  <dict>\n    <key>device-activation</key>\n    <dict/>\n  </dict>\n</plist></Protocol>\n</Document>";
+        let protocol = extract_protocol(body).expect("protocol");
+        assert!(protocol.contains("device-activation"));
+        let parsed: Value = plist::from_bytes(protocol.as_bytes()).expect("plist");
+        assert!(parsed.as_dictionary().is_some());
+    }
+
+    #[test]
+    fn extracts_single_line_protocol() {
+        let body = "<Protocol><plist version=\"1.0\"><dict/></plist></Protocol>";
+        assert_eq!(extract_protocol(body), Some("<plist version=\"1.0\"><dict/></plist>"));
+    }
+
+    #[test]
+    fn reports_missing_protocol() {
+        assert_eq!(extract_protocol("<Document><Error/></Document>"), None);
+    }
 }
 

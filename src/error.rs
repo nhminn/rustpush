@@ -43,8 +43,8 @@ pub enum PushError {
     TLSError(#[from] rustls::Error),
     #[error("Response error {0}")]
     StatusError(reqwest::StatusCode /* code */),
-    #[error("Failed to parse Albert Cert")]
-    AlbertCertParseError,
+    #[error("Failed to parse Albert Cert: {0}")]
+    AlbertCertParseError(String),
     #[cfg(feature = "macos-validation-data")]
     #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
