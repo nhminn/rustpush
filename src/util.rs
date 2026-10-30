@@ -63,15 +63,13 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
 
     if !locked.contains_key(url) {
         let content = REQWEST.get(url).send().await?;
-        if !content.status().is_success() {
-            return Err(PushError::StatusError(content.status()))
-        }
+        let body = checked_response_bytes("IDS bag request", content).await?;
 
         #[derive(Deserialize)]
         struct BagBody {
             bag: Data
         }
-        let parsed: BagBody = plist::from_bytes(&content.bytes().await?)?;
+        let parsed: BagBody = plist::from_bytes(&body)?;
         let dict: Dictionary = plist::from_bytes(parsed.bag.as_ref())?;
         
         locked.insert(url.to_string(), dict);
@@ -79,6 +77,44 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
 
     let bag = locked.get(url).unwrap();
     bag.get(item).cloned().ok_or(PushError::BagKeyNotFound)
+}
+
+/// Read an Apple HTTP response body, turning non-success statuses and empty
+/// bodies into an error that names the request. Apple's IDS/GSA endpoints
+/// return an empty body on some rejections, and feeding that to `plist` only
+/// yields a cryptic `UnexpectedEof` at offset 0.
+pub async fn checked_response_bytes(step: impl Into<String>, response: reqwest::Response) -> Result<Vec<u8>, PushError> {
+    let step = step.into();
+    let status = response.status();
+    let request_debug = response
+        .headers()
+        .get("x-apple-request-debug")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let request_uuid = response
+        .headers()
+        .get("x-apple-request-uuid")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let bytes = response.bytes().await?;
+
+    if !status.is_success() || bytes.is_empty() {
+        let body: String = String::from_utf8_lossy(&bytes).chars().take(400).collect();
+        warn!(
+            "{step} failed: HTTP {status}, request debug {request_debug:?}, {} response bytes: {body}",
+            bytes.len()
+        );
+        return Err(PushError::AppleRequestFailed {
+            step,
+            status: status.as_u16(),
+            request_debug,
+            request_uuid,
+            body_len: bytes.len(),
+            body,
+        });
+    }
+
+    Ok(bytes.to_vec())
 }
 
 

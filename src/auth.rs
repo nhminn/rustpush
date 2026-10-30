@@ -23,7 +23,7 @@ use deku::{DekuContainerWrite, DekuUpdate};
 use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
 use xml::{EventReader, reader::{self, ParserConfig2}};
 
-use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
+use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, checked_response_bytes, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -394,33 +394,113 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         }
     };
 
-    let base_headers = account.anisette.lock().await.get_headers().await?.clone();
-    let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
-
-    if let Some(cookie) = cookie {
-        anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
-    }
+    // setup.icloud.com expects an explicit plist content type. Without it the
+    // service rejects the request with an empty 401, which surfaces as a
+    // confusing plist UnexpectedEof at offset 0.
+    //
+    // Only forward the anisette fields the service accepts. In particular the
+    // anisette provider's X-Mme-Client-Info describes MobileSMS/AuthKit, while
+    // the delegate login must present the AOSKit identity below.
+    const DELEGATE_ANISETTE_HEADERS: &[&str] = &[
+        "X-Apple-I-Client-Time",
+        "X-Apple-I-TimeZone",
+        "X-Apple-Locale",
+        "X-Apple-I-MD-RINFO",
+        "X-Apple-I-MD-LU",
+        "X-Mme-Device-Id",
+        "X-Apple-I-MD",
+        "X-Apple-I-MD-M",
+    ];
 
     #[cfg(not(target_os = "macos"))]
     let delegate_client_info = format!("{} <{}>", crate::GSA_CURRENT_MAC_CLIENT_INFO, os_config.get_aoskit_version());
     #[cfg(target_os = "macos")]
     let delegate_client_info = os_config.get_mme_clientinfo(&os_config.get_aoskit_version());
 
-    let mut login_request = REQWEST.post(os_config.get_login_url())
-            .header("Accept-Encoding", "gzip")
-            .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
-            .header("X-Mme-Client-Info", delegate_client_info)
-            .header("X-Apple-ADSID", adsid)
-            .headers(anisette_headers.clone())
-            .basic_auth(username, Some(pet))
-            .body(plist_to_string(&request)?);
-    if let Some(validation_data) = &validation_data {
-        login_request = login_request.header("X-Mme-Nas-Qualify", base64_encode(validation_data));
-    }
-    let resp = login_request.send().await?;
-    let text = resp.text().await?;
+    let body = plist_to_string(&request)?;
 
-    let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
+    // A missing or rejected validation stamp should not make sign-in
+    // impossible: Apple has accepted delegate logins without it in the past.
+    // Try the stamp first, then a fresh anisette one-time password, then the
+    // same request without the stamp.
+    let attempts: &[(bool, bool)] = if validation_data.is_some() {
+        &[(true, false), (true, true), (false, true)]
+    } else {
+        &[(false, false), (false, true)]
+    };
+    let mut response_body = None;
+    let mut last_error = None;
+
+    for (attempt, &(include_validation, fresh_anisette)) in attempts.iter().enumerate() {
+        // A retry bypasses AnisetteClient's 60 second cache so a stale
+        // one-time password cannot fail every request.
+        let base_headers = if fresh_anisette {
+            account.anisette.lock().await.provider.get_anisette_headers().await?
+        } else {
+            account.anisette.lock().await.get_headers().await?.clone()
+        };
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in base_headers {
+            if !DELEGATE_ANISETTE_HEADERS.contains(&name.as_str()) {
+                continue;
+            }
+            headers.insert(HeaderName::from_str(&name).unwrap(), HeaderValue::from_str(&value).unwrap());
+        }
+        headers.insert("Accept-Encoding", HeaderValue::from_static("gzip"));
+        headers.insert("Accept", HeaderValue::from_static("*/*"));
+        headers.insert("Content-Type", HeaderValue::from_static("application/x-apple-plist"));
+        headers.insert("User-Agent", HeaderValue::from_str(&os_config.get_normal_ua("com.apple.iCloudHelper/282")).unwrap());
+        headers.insert("X-Mme-Client-Info", HeaderValue::from_str(&delegate_client_info).unwrap());
+        headers.insert("X-Apple-ADSID", HeaderValue::from_str(adsid).unwrap());
+        if let Some(cookie) = cookie {
+            headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
+        }
+        if include_validation {
+            if let Some(validation_data) = &validation_data {
+                headers.insert("X-Mme-Nas-Qualify", HeaderValue::from_str(&base64_encode(validation_data)).unwrap());
+            }
+        }
+
+        let step = if include_validation {
+            if attempt == 0 { "Apple ID delegate login".to_string() }
+            else { format!("Apple ID delegate login (attempt {}, fresh anisette)", attempt + 1) }
+        } else if validation_data.is_some() {
+            format!("Apple ID delegate login (attempt {}, without validation data)", attempt + 1)
+        } else {
+            format!("Apple ID delegate login (attempt {}, validation data unavailable)", attempt + 1)
+        };
+
+        let resp = REQWEST.post(os_config.get_login_url())
+            .headers(headers)
+            .basic_auth(username, Some(pet.as_str()))
+            .body(body.clone())
+            .send().await?;
+
+        match checked_response_bytes(step.as_str(), resp).await {
+            Ok(bytes) => {
+                response_body = Some(bytes);
+                break;
+            }
+            Err(err) => {
+                let retryable = matches!(&err, PushError::AppleRequestFailed { status, body_len, .. } if *status == 401 || *body_len == 0);
+                if retryable && attempt + 1 < attempts.len() {
+                    warn!("{err}; retrying Apple ID delegate login");
+                    last_error = Some(err);
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    let response_body = match response_body {
+        Some(body) => body,
+        None => return Err(last_error.expect("delegate login failed without an error")),
+    };
+
+    let parsed = plist::Value::from_reader(Cursor::new(response_body.as_slice()))?;
     let parsed_dict = parsed.as_dictionary().unwrap();
 
     if let Some(error) = parsed_dict.get("localizedError") {
@@ -536,10 +616,11 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
     let resp = REQWEST.post(url)
         .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
         .header("x-protocol-version", os_config.get_protocol_version())
+        .header("content-type", "application/x-apple-plist")
         .header("content-encoding", "gzip")
         .body(gzip_normal(&plist_to_buf(&auth_cert)?)?)
-        .send().await?
-        .bytes().await?;
+        .send().await?;
+    let resp = checked_response_bytes("IDS certificate request", resp).await?;
 
     let parsed: AuthCertResponse = plist::from_bytes(&resp)?;
     if parsed.status != 0 {
@@ -638,10 +719,11 @@ pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_con
     let resp = REQWEST.post(url)
         .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
         .header("x-protocol-version", os_config.get_protocol_version())
+        .header("content-type", "application/x-apple-plist")
         .header("content-encoding", "gzip")
         .body(gzip_normal(&plist_to_buf(&users)?)?)
-        .send().await?
-        .bytes().await?;
+        .send().await?;
+    let resp = checked_response_bytes("IDS SMS-less certificate request", resp).await?;
 
     #[derive(Deserialize)]
     #[serde(rename_all = "kebab-case")]

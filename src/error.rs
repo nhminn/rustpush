@@ -134,6 +134,15 @@ pub enum PushError {
     ResourceGenTimeout,
     #[error("Delegate {0} login failed status {1} error {2}")]
     DelegateLoginFailed(String, i64, String),
+    #[error("{step} failed with HTTP {status} (request debug: {request_debug:?}, request UUID: {request_uuid:?}, {body_len} response bytes): {body}")]
+    AppleRequestFailed {
+        step: String,
+        status: u16,
+        request_debug: Option<String>,
+        request_uuid: Option<String>,
+        body_len: usize,
+        body: String,
+    },
     #[error("Cloudkit error {0:?}")]
     CloudKitError(cloudkit_proto::response_operation::Result),
     #[error("NickName Crypto Error: {0}")]

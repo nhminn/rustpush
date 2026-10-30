@@ -19,7 +19,7 @@ use crate::util::DebugMutex;
 
 use rand::{Rng, RngCore};
 
-use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
+use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, checked_response_bytes, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
 
 
 #[repr(C)]
@@ -824,9 +824,9 @@ impl IDSUser {
     }
     
     pub async fn get_handle_data(&self, aps: &APSState) -> Result<Vec<ResultHandle>, PushError> {
-        let request = self.base_request(aps, "id-get-handles")?
-            .send(&REQWEST).await?
-            .bytes().await?;
+        let response = self.base_request(aps, "id-get-handles")?
+            .send(&REQWEST).await?;
+        let request = checked_response_bytes("IDS handle lookup", response).await?;
 
         let parsed: HandleResult = plist::from_bytes(&request)?;
         let Some(handles) = parsed.handles else {
@@ -843,9 +843,9 @@ impl IDSUser {
     }
 
     pub async fn get_dependent_registrations(&self, aps: &APSState) -> Result<Vec<PrivateDeviceInfo>, PushError> {
-        let request = self.base_request(aps, "id-get-dependent-registrations")?
-            .send(&REQWEST).await?
-            .bytes().await?;
+        let response = self.base_request(aps, "id-get-dependent-registrations")?
+            .send(&REQWEST).await?;
+        let request = checked_response_bytes("IDS dependent registration lookup", response).await?;
 
         let parsed: Value = plist::from_bytes(&request)?;
 
@@ -1126,7 +1126,8 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             .sign(&user.auth_keypair, KeyType::Auth, aps, Some(idx))?;
     }
 
-    let response = request.send(&REQWEST).await?.bytes().await?;
+    let response = request.send(&REQWEST).await?;
+    let response = checked_response_bytes("IDS device registration", response).await?;
 
     debug!("register response {}", std::str::from_utf8(&response).expect("resp not utf8?"));
 
