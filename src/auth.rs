@@ -384,13 +384,14 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     };
 
     // Validation data is Apple's Mac-hardware attestation. When it is unavailable
-    // (for example a public-source build without the closed mint), still attempt
-    // the delegate login; Apple may accept the request without the header.
-    let validation_data = match os_config.generate_validation_data().await {
-        Ok(data) => Some(data),
+    // (for example the app-side mint failed), still attempt the delegate login;
+    // some accounts accept it without the stamp. Keep the exact reason so a
+    // failure names the missing precondition instead of only the HTTP status.
+    let (validation_data, validation_error) = match os_config.generate_validation_data().await {
+        Ok(data) => (Some(data), None),
         Err(e) => {
             warn!("Could not generate validation data for delegate login: {e}");
-            None
+            (None, Some(e.to_string()))
         }
     };
 
@@ -468,7 +469,11 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         } else if validation_data.is_some() {
             format!("Apple ID delegate login (attempt {}, without validation data)", attempt + 1)
         } else {
-            format!("Apple ID delegate login (attempt {}, validation data unavailable)", attempt + 1)
+            format!(
+                "Apple ID delegate login (attempt {}, validation data unavailable: {})",
+                attempt + 1,
+                validation_error.as_deref().unwrap_or("unknown error")
+            )
         };
 
         let resp = REQWEST.post(os_config.get_login_url())

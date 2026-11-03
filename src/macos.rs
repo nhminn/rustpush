@@ -30,13 +30,24 @@ pub fn set_validation_data(session250: Vec<u8>, data: Vec<u8>) {
     });
 }
 
-fn get_validation_data(session250: &[u8]) -> Option<Vec<u8>> {
+fn get_validation_data(session250: &[u8]) -> Result<Vec<u8>, PushError> {
     let guard = VALIDATION_DATA.lock().unwrap();
-    let cache = guard.as_ref()?;
-    if cache.session250 != session250 || cache.created.elapsed() > Duration::from_secs(600) {
-        return None;
+    let Some(cache) = guard.as_ref() else {
+        return Err(PushError::ValidationDataUnavailable(
+            "no validation data was prepared".to_string(),
+        ));
+    };
+    if cache.session250 != session250 {
+        return Err(PushError::ValidationDataUnavailable(
+            "the prepared stamp belongs to different hardware".to_string(),
+        ));
     }
-    Some(cache.data.clone())
+    if cache.created.elapsed() > Duration::from_secs(600) {
+        return Err(PushError::ValidationDataUnavailable(
+            "the prepared stamp expired".to_string(),
+        ));
+    }
+    Ok(cache.data.clone())
 }
 
 pub fn clear_validation_data() {
@@ -200,16 +211,12 @@ impl OSConfig for MacOSConfig {
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
         let session250 = hardware_config_to_bin(&self.inner)?;
-        if let Some(data) = get_validation_data(&session250) {
-            return Ok(data);
-        }
-
         // The public OpenAbsinthe dependency is a stub. The real mint lives in the
         // app's vendored Kotlin implementation; the Dart setup flow mints a stamp
         // and installs it here before the delegate login / IDS registration.
-        Err(PushError::ValidationDataUnavailable(
-            "no validation data was prepared for this hardware".to_string(),
-        ))
+        // Report why the cache has no usable stamp: it is the difference between
+        // "the mint failed" and "the stamp is for another hardware profile".
+        get_validation_data(&session250)
     }
 
     fn get_protocol_version(&self) -> u32 {
